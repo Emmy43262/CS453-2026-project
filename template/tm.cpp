@@ -26,16 +26,102 @@
 #include <tm.hpp>
 
 #include "macros.h"
+#include <atomic>
+#include <assert.h>
+#include <cstdlib>
+#include <vector>
+#include <list>
+#include <mutex>
+#include <unordered_map>
+
+struct Region
+{
+
+    size_t align;
+    size_t size;
+
+    std::atomic<uint64_t> clock{0};
+    std::list<Segment> segments;
+
+    Region(size_t size, size_t align)
+    {
+        this->align = align;
+        this->size = size;
+        this->segments.push_back(Segment(size, align));
+    }
+
+    uint64_t increment_clock()
+    {
+        return clock.fetch_add(1) + 1;
+    }
+
+    uint64_t get_clock()
+    {
+        return clock.load();
+    }
+};
+
+struct Segment
+{
+    std::vector<Word> words;
+    void *mem;
+    size_t size;
+
+    Segment(size_t size, size_t align)
+    {
+        assert(size % align == 0);
+
+        words = std::vector<Word>(size / align);
+        this->size = size;
+
+        mem = malloc(size);
+        if (mem == NULL)
+            throw std::bad_alloc();
+        memset(mem, 0, size);
+    }
+    ~Segment()
+    {
+        free(mem);
+    }
+};
+
+struct Word
+{
+    uint64_t write_time = 0;
+    std::mutex lock;
+    Word()
+    {
+    }
+};
+
+struct Transaction
+{
+    Region *region;
+    uint64_t rv;
+    std::list<Segment> segments;
+
+    Transaction(Region *region)
+    {
+        this->region = region;
+        this->rv = region->get_clock();
+    }
+};
 
 /** Create (i.e. allocate + init) a new shared memory region, with one first non-free-able allocated segment of the requested size and alignment.
  * @param size  Size of the first shared segment of memory to allocate (in bytes), must be a positive multiple of the alignment
  * @param align Alignment (in bytes, must be a power of 2) that the shared memory region must support
  * @return Opaque shared memory region handle, 'invalid_shared' on failure
  **/
-shared_t tm_create(size_t unused(size), size_t unused(align))
+shared_t tm_create(size_t size, size_t align)
 {
-    // TODO: tm_create(size_t, size_t)
-    return invalid_shared;
+    try
+    {
+        return new Region(size, align);
+    }
+    catch (...)
+    {
+        return invalid_shared;
+    }
 }
 
 /** Destroy (i.e. clean-up + free) a given shared memory region.
@@ -50,30 +136,27 @@ void tm_destroy(shared_t unused(shared))
  * @param shared Shared memory region to query
  * @return Start address of the first allocated segment
  **/
-void *tm_start(shared_t unused(shared))
+void *tm_start(shared_t shared)
 {
-    // TODO: tm_start(shared_t)
-    return NULL;
+    return static_cast<Region *>(shared)->segments.front().mem;
 }
 
 /** [thread-safe] Return the size (in bytes) of the first allocated segment of the shared memory region.
  * @param shared Shared memory region to query
  * @return First allocated segment size
  **/
-size_t tm_size(shared_t unused(shared))
+size_t tm_size(shared_t shared)
 {
-    // TODO: tm_size(shared_t)
-    return 0;
+    return static_cast<Region *>(shared)->segments.front().size;
 }
 
 /** [thread-safe] Return the alignment (in bytes) of the memory accesses on the given shared memory region.
  * @param shared Shared memory region to query
  * @return Alignment used globally
  **/
-size_t tm_align(shared_t unused(shared))
+size_t tm_align(shared_t shared)
 {
-    // TODO: tm_align(shared_t)
-    return 0;
+    return static_cast<Region *>(shared)->align;
 }
 
 /** [thread-safe] Begin a new transaction on the given shared memory region.
@@ -81,10 +164,16 @@ size_t tm_align(shared_t unused(shared))
  * @param is_ro  Whether the transaction is read-only
  * @return Opaque transaction ID, 'invalid_tx' on failure
  **/
-tx_t tm_begin(shared_t unused(shared), bool unused(is_ro))
+tx_t tm_begin(shared_t shared, bool unused(is_ro))
 {
-    // TODO: tm_begin(shared_t)
-    return invalid_tx;
+    try
+    {
+        return reinterpret_cast<tx_t>(new Transaction(static_cast<Region *>(shared)));
+    }
+    catch (...)
+    {
+        return invalid_tx;
+    }
 }
 
 /** [thread-safe] End the given transaction.
@@ -133,10 +222,22 @@ bool tm_write(shared_t unused(shared), tx_t unused(tx), void const *unused(sourc
  * @param target Pointer in private memory receiving the address of the first byte of the newly allocated, aligned segment
  * @return Whether the whole transaction can continue (success/nomem), or not (abort_alloc)
  **/
-Alloc tm_alloc(shared_t unused(shared), tx_t unused(tx), size_t unused(size), void **unused(target))
+Alloc tm_alloc(shared_t shared, tx_t tx, size_t size, void **(target))
 {
-    // TODO: tm_alloc(shared_t, tx_t, size_t, void**)
-    return Alloc::abort;
+    Region *region = static_cast<Region *>(shared);
+    Transaction *transaction = reinterpret_cast<Transaction *>(tx);
+
+    try
+    {
+        Segment &new_segment = transaction->segments.emplace_back(size, region->align);
+        *target = new_segment.mem;
+    }
+    catch (const std::bad_alloc &)
+    {
+        return Alloc::nomem;
+    }
+
+    return Alloc::success;
 }
 
 /** [thread-safe] Memory freeing in the given transaction.
