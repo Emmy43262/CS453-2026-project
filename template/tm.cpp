@@ -362,6 +362,7 @@ Alloc tm_alloc(shared_t shared, tx_t tx, size_t size, void **(target))
 
     try
     {
+        std::unique_lock<std::shared_mutex> segments_lock(region->segments_lock);
         Segment &new_segment = transaction->segments.emplace_back(size, region->align);
         *target = new_segment.mem;
     }
