@@ -140,6 +140,21 @@ struct Word
     {
         return write_status.load() & 1;
     }
+
+    bool try_lock()
+    {
+        uint64_t value = write_status.load();
+
+        if (value & 1)
+            return false;
+
+        return write_status.compare_exchange_strong(value, value | 1);
+    }
+
+    void release_lock(uint64_t wv)
+    {
+        write_status.store(wv << 1);
+    }
 };
 
 struct Transaction
@@ -148,7 +163,7 @@ struct Transaction
     uint64_t rv;
     std::list<Segment> segments;
     std::unordered_map<uint64_t, std::pair<void *, Segment *>> dirty_memory;
-    std::unordered_set<uint64_t> read_memory;
+    std::unordered_set<std::pair<uint64_t, Segment *>> read_memory;
     std::unordered_set<uint64_t> freed_memory;
 
     Transaction(Region *region)
@@ -167,7 +182,8 @@ struct Transaction
  * @param align Alignment (in bytes, must be a power of 2) that the shared memory region must support
  * @return Opaque shared memory region handle, 'invalid_shared' on failure
  **/
-shared_t tm_create(size_t size, size_t align)
+shared_t
+tm_create(size_t size, size_t align)
 {
     try
     {
@@ -241,8 +257,60 @@ bool tm_end(shared_t shared, tx_t tx)
     Region *region = static_cast<Region *>(shared);
     Transaction *transaction = reinterpret_cast<Transaction *>(tx);
 
-    for (auto dirty_word : transaction->dirty_memory)
+    for (auto dirty_address : transaction->dirty_memory)
     {
+        uint64_t address = dirty_address.first;
+        Segment *word_segment = dirty_address.second.second;
+
+        Word *word = word_segment->get_word(address);
+
+        bool locked = false;
+        for (int i = 0; i < 100; i++)
+        {
+            locked = word->try_lock();
+            if (locked)
+                break;
+        }
+        if (!locked)
+            return;
+    }
+
+    // TODO Free locks on failure
+    // TODO Transaction destructor
+    // TODO handle free
+
+    uint64_t wv = region->increment_clock();
+
+    if (wv != transaction->rv + 1)
+    {
+        for (auto read_address : transaction->read_memory)
+        {
+            Word *word = read_address.second->get_word(read_address.first);
+
+            uint64_t lock_value = word->write_status.load();
+
+            if (lock_value & 1 && transaction->dirty_memory.find(read_address.first) == transaction->dirty_memory.end())
+                return false;
+
+            if (lock_value >> 1 > transaction->rv)
+                return false;
+        }
+    }
+
+    for (auto dirty_address : transaction->dirty_memory)
+    {
+        uint64_t address = dirty_address.first;
+        Segment *word_segment = dirty_address.second.second;
+
+        memcpy((void *)address, dirty_address.second.first, region->align);
+    }
+
+    for (auto dirty_address : transaction->dirty_memory)
+    {
+        uint64_t address = dirty_address.first;
+        Segment *word_segment = dirty_address.second.second;
+
+        word_segment->get_word(address)->release_lock(wv);
     }
 
     return true;
@@ -305,7 +373,7 @@ bool tm_read(shared_t shared, tx_t tx, void const *source, size_t size, void *ta
             {
                 return false;
             }
-            transaction->read_memory.insert(source_position + offset);
+            transaction->read_memory.insert({source_position + offset, source_segment});
         }
     }
     return true;
