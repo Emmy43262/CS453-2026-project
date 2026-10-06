@@ -33,6 +33,8 @@
 #include <list>
 #include <mutex>
 #include <shared_mutex>
+#include <set>
+#include <map>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -43,8 +45,13 @@ struct Region
     size_t size;
 
     std::atomic<uint64_t> clock{0};
+
     std::list<Segment> segments;
     std::shared_mutex segments_lock;
+
+    std::mutex transaction_start_lock;
+    std::multiset<uint64_t> transaction_starts;
+    std::map<uint64_t, uint64_t> memory_to_free;
 
     Region(size_t size, size_t align)
     {
@@ -147,7 +154,11 @@ struct Transaction
     Transaction(Region *region)
     {
         this->region = region;
+
+        region->transaction_start_lock.lock();
         this->rv = region->get_clock();
+        region->transaction_starts.insert(this->rv);
+        region->transaction_start_lock.unlock();
     }
 };
 
