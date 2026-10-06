@@ -147,7 +147,7 @@ struct Transaction
     Region *region;
     uint64_t rv;
     std::list<Segment> segments;
-    std::unordered_map<uint64_t, void *> dirty_memory;
+    std::unordered_map<uint64_t, std::pair<void *, Segment *>> dirty_memory;
     std::unordered_set<uint64_t> read_memory;
     std::unordered_set<uint64_t> freed_memory;
 
@@ -236,10 +236,16 @@ tx_t tm_begin(shared_t shared, bool unused(is_ro))
  * @param tx     Transaction to end
  * @return Whether the whole transaction committed
  **/
-bool tm_end(shared_t unused(shared), tx_t unused(tx))
+bool tm_end(shared_t shared, tx_t tx)
 {
-    // TODO: tm_end(shared_t, tx_t)
-    return false;
+    Region *region = static_cast<Region *>(shared);
+    Transaction *transaction = reinterpret_cast<Transaction *>(tx);
+
+    for (auto dirty_word : transaction->dirty_memory)
+    {
+    }
+
+    return true;
 }
 
 /** [thread-safe] Read operation in the given transaction, source in the shared region and target in a private region.
@@ -283,7 +289,7 @@ bool tm_read(shared_t shared, tx_t tx, void const *source, size_t size, void *ta
     for (size_t offset = 0; offset < size; offset += align)
     {
         if (transaction->dirty_memory.find(source_position + offset) != transaction->dirty_memory.end())
-            memcpy((void *)((uint64_t)(target) + offset), transaction->dirty_memory[source_position + offset], align);
+            memcpy((void *)((uint64_t)(target) + offset), transaction->dirty_memory[source_position + offset].first, align);
         else
         {
             Word *current_word = source_segment->get_word(source_position + offset);
@@ -327,6 +333,20 @@ bool tm_write(shared_t shared, tx_t tx, void const *source, size_t size, void *t
         }
     }
 
+    Segment *source_segment = nullptr;
+    std::shared_lock<std::shared_mutex> segments_lock(region->segments_lock);
+    for (auto &segment : region->segments)
+    {
+        if (segment.is_in(source, size))
+        {
+            source_segment = &segment;
+            break;
+        }
+    }
+    segments_lock.unlock();
+    if (source_segment == nullptr)
+        return false;
+
     uint64_t source_position = reinterpret_cast<uint64_t>(source);
     uint64_t target_position = reinterpret_cast<uint64_t>(target);
     size_t align = region->align;
@@ -334,7 +354,7 @@ bool tm_write(shared_t shared, tx_t tx, void const *source, size_t size, void *t
     {
         if (transaction->dirty_memory.find(target_position + offset) != transaction->dirty_memory.end())
         {
-            memcpy(transaction->dirty_memory[target_position + offset], (void *)(source_position + offset), region->align);
+            memcpy(transaction->dirty_memory[target_position + offset].first, (void *)(source_position + offset), region->align);
             continue;
         }
 
@@ -342,7 +362,7 @@ bool tm_write(shared_t shared, tx_t tx, void const *source, size_t size, void *t
         if (mem == nullptr)
             return false;
         memcpy(mem, (void *)(source_position + offset), region->align);
-        transaction->dirty_memory[target_position + offset] = mem;
+        transaction->dirty_memory[target_position + offset] = {mem, source_segment};
     }
 
     return true;
