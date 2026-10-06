@@ -301,10 +301,40 @@ bool tm_read(shared_t shared, tx_t tx, void const *source, size_t size, void *ta
  * @param target Target start address (in the shared region)
  * @return Whether the whole transaction can continue
  **/
-bool tm_write(shared_t unused(shared), tx_t unused(tx), void const *unused(source), size_t unused(size), void *unused(target))
+bool tm_write(shared_t shared, tx_t tx, void const *source, size_t size, void *target)
 {
-    // TODO: tm_write(shared_t, tx_t, void const*, size_t, void*)
-    return false;
+    Region *region = static_cast<Region *>(shared);
+    Transaction *transaction = reinterpret_cast<Transaction *>(tx);
+
+    for (auto &transaction_segment : transaction->segments)
+    {
+        if (transaction_segment.is_in(target, size))
+        {
+            memcpy(target, source, size);
+            return true;
+        }
+    }
+
+    uint64_t source_position = reinterpret_cast<uint64_t>(source);
+    uint64_t target_position = reinterpret_cast<uint64_t>(target);
+    size_t align = region->align;
+    for (size_t offset = 0; offset < size; offset += align)
+    {
+
+        if (transaction->dirty_memory.find(target_position + offset) != transaction->dirty_memory.end())
+        {
+            memcpy(transaction->dirty_memory[target_position + offset], (void *)(source_position + offset), region->align);
+            continue;
+        }
+
+        void *mem = malloc(region->align);
+        if (mem == nullptr)
+            return false;
+        memcpy(mem, (void *)(source_position + offset), region->align);
+        transaction->dirty_memory[target_position + offset] = mem;
+    }
+
+    return true;
 }
 
 /** [thread-safe] Memory allocation in the given transaction.
