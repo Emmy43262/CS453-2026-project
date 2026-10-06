@@ -32,7 +32,9 @@
 #include <vector>
 #include <list>
 #include <mutex>
+#include <shared_mutex>
 #include <unordered_map>
+#include <unordered_set>
 
 struct Region
 {
@@ -42,6 +44,7 @@ struct Region
 
     std::atomic<uint64_t> clock{0};
     std::list<Segment> segments;
+    std::shared_mutex segments_lock;
 
     Region(size_t size, size_t align)
     {
@@ -66,6 +69,7 @@ struct Segment
     std::vector<Word> words;
     void *mem;
     size_t size;
+    size_t align;
 
     Segment(size_t size, size_t align)
     {
@@ -73,6 +77,7 @@ struct Segment
 
         words = std::vector<Word>(size / align);
         this->size = size;
+        this->align = align;
 
         mem = malloc(size);
         if (mem == NULL)
@@ -83,14 +88,50 @@ struct Segment
     {
         free(mem);
     }
+
+    bool is_in(const void *address, int size)
+    {
+        uint64_t segment_start = reinterpret_cast<uint64_t>(mem);
+        uint64_t address_start = reinterpret_cast<uint64_t>(address);
+
+        return (address_start >= segment_start) && (address_start < segment_start + this->size) && (address_start + size <= segment_start + this->size);
+    }
+
+    void *read_unsafe(const void *address)
+    {
+        uint64_t segment_start = reinterpret_cast<uint64_t>(mem);
+        uint64_t address_start = reinterpret_cast<uint64_t>(address);
+
+        return (void *)(reinterpret_cast<uint64_t>(mem) + (address_start - segment_start));
+    }
+
+    Word *get_word(uint64_t address)
+    {
+        size_t offset = (address - (uint64_t)mem) / align;
+
+        assert(offset >= 0);
+        assert(offset * align < size);
+
+        return &words[offset];
+    }
 };
 
 struct Word
 {
-    uint64_t write_time = 0;
-    std::mutex lock;
+    std::atomic<uint64_t> write_status{0};
+
     Word()
     {
+    }
+
+    uint64_t write_version()
+    {
+        return write_status.load() >> 1;
+    }
+
+    uint64_t is_locked()
+    {
+        return write_status.load() & 1;
     }
 };
 
@@ -99,6 +140,8 @@ struct Transaction
     Region *region;
     uint64_t rv;
     std::list<Segment> segments;
+    std::unordered_map<uint64_t, void *> dirty_memory;
+    std::unordered_set<uint64_t> read_memory;
 
     Transaction(Region *region)
     {
@@ -195,10 +238,60 @@ bool tm_end(shared_t unused(shared), tx_t unused(tx))
  * @param target Target start address (in a private region)
  * @return Whether the whole transaction can continue
  **/
-bool tm_read(shared_t unused(shared), tx_t unused(tx), void const *unused(source), size_t unused(size), void *unused(target))
+bool tm_read(shared_t shared, tx_t tx, void const *source, size_t size, void *target)
 {
-    // TODO: tm_read(shared_t, tx_t, void const*, size_t, void*)
-    return false;
+    Region *region = static_cast<Region *>(shared);
+    Transaction *transaction = reinterpret_cast<Transaction *>(tx);
+
+    for (auto &transaction_segment : transaction->segments)
+    {
+        if (transaction_segment.is_in(source, size))
+        {
+            memcpy(target, source, size);
+            return true;
+        }
+    }
+
+    Segment *source_segment = nullptr;
+    std::shared_lock<std::shared_mutex> segments_lock(region->segments_lock);
+    for (auto &segment : region->segments)
+    {
+        if (segment.is_in(source, size))
+        {
+            source_segment = &segment;
+            break;
+        }
+    }
+    segments_lock.unlock();
+    if (source_segment == nullptr)
+        return false;
+
+    uint64_t source_position = reinterpret_cast<uint64_t>(source);
+    size_t align = region->align;
+    for (size_t offset = 0; offset < size; offset += align)
+    {
+        if (transaction->dirty_memory.find(source_position + offset) != transaction->dirty_memory.end())
+            memcpy((void *)((uint64_t)(target) + offset), transaction->dirty_memory[source_position + offset], align);
+        else
+        {
+            Word *current_word = source_segment->get_word(source_position + offset);
+
+            uint64_t lock_value = current_word->write_status.load();
+            if (lock_value & 1 || (lock_value >> 1) > transaction->rv)
+            {
+                return false;
+            }
+            memcpy((void *)((uint64_t)(target) + offset), (void *)((uint64_t)(source) + offset), align);
+            lock_value = current_word->write_status.load();
+            if (lock_value & 1 || (lock_value >> 1) > transaction->rv)
+            {
+                return false;
+            }
+
+            transaction->read_memory.insert(source_position + offset);
+        }
+    }
+    return true;
 }
 
 /** [thread-safe] Write operation in the given transaction, source in a private region and target in the shared region.
