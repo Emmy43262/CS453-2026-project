@@ -305,6 +305,11 @@ bool tm_end(shared_t shared, tx_t tx)
         memcpy((void *)address, dirty_address.second.first, region->align);
     }
 
+    {
+        std::unique_lock<std::shared_mutex> segments_lock(region->segments_lock);
+        region->segments.splice(region->segments.end(), transaction->segments);
+    }
+
     for (auto dirty_address : transaction->dirty_memory)
     {
         uint64_t address = dirty_address.first;
