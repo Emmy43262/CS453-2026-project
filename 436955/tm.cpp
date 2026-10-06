@@ -37,37 +37,39 @@
 #include <map>
 #include <unordered_map>
 #include <unordered_set>
+#include <cstring>
 
-struct Region
+struct Word
 {
+    std::atomic<uint64_t> write_status{0};
 
-    size_t align;
-    size_t size;
-
-    std::atomic<uint64_t> clock{0};
-
-    std::list<Segment> segments;
-    std::shared_mutex segments_lock;
-
-    std::mutex transaction_start_lock;
-    std::multiset<uint64_t> transaction_starts;
-    std::map<uint64_t, uint64_t> memory_to_free;
-
-    Region(size_t size, size_t align)
+    Word()
     {
-        this->align = align;
-        this->size = size;
-        this->segments.push_back(Segment(size, align));
     }
 
-    uint64_t increment_clock()
+    uint64_t write_version()
     {
-        return clock.fetch_add(1) + 1;
+        return write_status.load() >> 1;
     }
 
-    uint64_t get_clock()
+    uint64_t is_locked()
     {
-        return clock.load();
+        return write_status.load() & 1;
+    }
+
+    bool try_lock()
+    {
+        uint64_t value = write_status.load();
+
+        if (value & 1)
+            return false;
+
+        return write_status.compare_exchange_strong(value, value | 1);
+    }
+
+    void release_lock(uint64_t wv)
+    {
+        write_status.store(wv << 1);
     }
 };
 
@@ -123,37 +125,36 @@ struct Segment
     }
 };
 
-struct Word
+struct Region
 {
-    std::atomic<uint64_t> write_status{0};
 
-    Word()
+    size_t align;
+    size_t size;
+
+    std::atomic<uint64_t> clock{0};
+
+    std::list<Segment> segments;
+    std::shared_mutex segments_lock;
+
+    std::mutex transaction_start_lock;
+    std::multiset<uint64_t> transaction_starts;
+    std::map<uint64_t, uint64_t> memory_to_free;
+
+    Region(size_t size, size_t align)
     {
+        this->align = align;
+        this->size = size;
+        this->segments.emplace_back(size, align);
     }
 
-    uint64_t write_version()
+    uint64_t increment_clock()
     {
-        return write_status.load() >> 1;
+        return clock.fetch_add(1) + 1;
     }
 
-    uint64_t is_locked()
+    uint64_t get_clock()
     {
-        return write_status.load() & 1;
-    }
-
-    bool try_lock()
-    {
-        uint64_t value = write_status.load();
-
-        if (value & 1)
-            return false;
-
-        return write_status.compare_exchange_strong(value, value | 1);
-    }
-
-    void release_lock(uint64_t wv)
-    {
-        write_status.store(wv << 1);
+        return clock.load();
     }
 };
 
@@ -163,7 +164,7 @@ struct Transaction
     uint64_t rv;
     std::list<Segment> segments;
     std::unordered_map<uint64_t, std::pair<void *, Segment *>> dirty_memory;
-    std::unordered_set<std::pair<uint64_t, Segment *>> read_memory;
+    std::unordered_map<uint64_t, Segment *> read_memory;
     std::unordered_set<uint64_t> freed_memory;
 
     Transaction(Region *region)
@@ -183,7 +184,7 @@ struct Transaction
  * @return Opaque shared memory region handle, 'invalid_shared' on failure
  **/
 shared_t
-tm_create(size_t size, size_t align)
+tm_create(size_t size, size_t align) noexcept
 {
     try
     {
@@ -198,7 +199,7 @@ tm_create(size_t size, size_t align)
 /** Destroy (i.e. clean-up + free) a given shared memory region.
  * @param shared Shared memory region to destroy, with no running transaction
  **/
-void tm_destroy(shared_t unused(shared))
+void tm_destroy(shared_t unused(shared)) noexcept
 {
     // TODO: tm_destroy(shared_t)
 }
@@ -207,7 +208,7 @@ void tm_destroy(shared_t unused(shared))
  * @param shared Shared memory region to query
  * @return Start address of the first allocated segment
  **/
-void *tm_start(shared_t shared)
+void *tm_start(shared_t shared) noexcept
 {
     return static_cast<Region *>(shared)->segments.front().mem;
 }
@@ -216,7 +217,7 @@ void *tm_start(shared_t shared)
  * @param shared Shared memory region to query
  * @return First allocated segment size
  **/
-size_t tm_size(shared_t shared)
+size_t tm_size(shared_t shared) noexcept
 {
     return static_cast<Region *>(shared)->segments.front().size;
 }
@@ -225,7 +226,7 @@ size_t tm_size(shared_t shared)
  * @param shared Shared memory region to query
  * @return Alignment used globally
  **/
-size_t tm_align(shared_t shared)
+size_t tm_align(shared_t shared) noexcept
 {
     return static_cast<Region *>(shared)->align;
 }
@@ -235,7 +236,7 @@ size_t tm_align(shared_t shared)
  * @param is_ro  Whether the transaction is read-only
  * @return Opaque transaction ID, 'invalid_tx' on failure
  **/
-tx_t tm_begin(shared_t shared, bool unused(is_ro))
+tx_t tm_begin(shared_t shared, bool unused(is_ro)) noexcept
 {
     try
     {
@@ -252,7 +253,7 @@ tx_t tm_begin(shared_t shared, bool unused(is_ro))
  * @param tx     Transaction to end
  * @return Whether the whole transaction committed
  **/
-bool tm_end(shared_t shared, tx_t tx)
+bool tm_end(shared_t shared, tx_t tx) noexcept
 {
     Region *region = static_cast<Region *>(shared);
     Transaction *transaction = reinterpret_cast<Transaction *>(tx);
@@ -272,7 +273,7 @@ bool tm_end(shared_t shared, tx_t tx)
                 break;
         }
         if (!locked)
-            return;
+            return false;
     }
 
     // TODO Free locks on failure
@@ -329,7 +330,7 @@ bool tm_end(shared_t shared, tx_t tx)
  * @param target Target start address (in a private region)
  * @return Whether the whole transaction can continue
  **/
-bool tm_read(shared_t shared, tx_t tx, void const *source, size_t size, void *target)
+bool tm_read(shared_t shared, tx_t tx, void const *source, size_t size, void *target) noexcept
 {
     Region *region = static_cast<Region *>(shared);
     Transaction *transaction = reinterpret_cast<Transaction *>(tx);
@@ -378,7 +379,7 @@ bool tm_read(shared_t shared, tx_t tx, void const *source, size_t size, void *ta
             {
                 return false;
             }
-            transaction->read_memory.insert({source_position + offset, source_segment});
+            transaction->read_memory[source_position + offset] = source_segment;
         }
     }
     return true;
@@ -392,7 +393,7 @@ bool tm_read(shared_t shared, tx_t tx, void const *source, size_t size, void *ta
  * @param target Target start address (in the shared region)
  * @return Whether the whole transaction can continue
  **/
-bool tm_write(shared_t shared, tx_t tx, void const *source, size_t size, void *target)
+bool tm_write(shared_t shared, tx_t tx, void const *source, size_t size, void *target) noexcept
 {
     Region *region = static_cast<Region *>(shared);
     Transaction *transaction = reinterpret_cast<Transaction *>(tx);
@@ -448,7 +449,7 @@ bool tm_write(shared_t shared, tx_t tx, void const *source, size_t size, void *t
  * @param target Pointer in private memory receiving the address of the first byte of the newly allocated, aligned segment
  * @return Whether the whole transaction can continue (success/nomem), or not (abort_alloc)
  **/
-Alloc tm_alloc(shared_t shared, tx_t tx, size_t size, void **(target))
+Alloc tm_alloc(shared_t shared, tx_t tx, size_t size, void **(target)) noexcept
 {
     Region *region = static_cast<Region *>(shared);
     Transaction *transaction = reinterpret_cast<Transaction *>(tx);
@@ -472,7 +473,7 @@ Alloc tm_alloc(shared_t shared, tx_t tx, size_t size, void **(target))
  * @param target Address of the first byte of the previously allocated segment to deallocate
  * @return Whether the whole transaction can continue
  **/
-bool tm_free(shared_t shared, tx_t tx, void *target)
+bool tm_free(shared_t shared, tx_t tx, void *target) noexcept
 {
     Region *region = static_cast<Region *>(shared);
     Transaction *transaction = reinterpret_cast<Transaction *>(tx);
