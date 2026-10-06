@@ -142,6 +142,7 @@ struct Transaction
     std::list<Segment> segments;
     std::unordered_map<uint64_t, void *> dirty_memory;
     std::unordered_set<uint64_t> read_memory;
+    std::unordered_set<uint64_t> freed_memory;
 
     Transaction(Region *region)
     {
@@ -320,7 +321,6 @@ bool tm_write(shared_t shared, tx_t tx, void const *source, size_t size, void *t
     size_t align = region->align;
     for (size_t offset = 0; offset < size; offset += align)
     {
-
         if (transaction->dirty_memory.find(target_position + offset) != transaction->dirty_memory.end())
         {
             memcpy(transaction->dirty_memory[target_position + offset], (void *)(source_position + offset), region->align);
@@ -368,8 +368,20 @@ Alloc tm_alloc(shared_t shared, tx_t tx, size_t size, void **(target))
  * @param target Address of the first byte of the previously allocated segment to deallocate
  * @return Whether the whole transaction can continue
  **/
-bool tm_free(shared_t unused(shared), tx_t unused(tx), void *unused(target))
+bool tm_free(shared_t shared, tx_t tx, void *target)
 {
-    // TODO: tm_free(shared_t, tx_t, void*)
-    return false;
+    Region *region = static_cast<Region *>(shared);
+    Transaction *transaction = reinterpret_cast<Transaction *>(tx);
+
+    for (auto it = transaction->segments.begin(); it != transaction->segments.end(); ++it)
+    {
+        if (it->mem == target)
+        {
+            transaction->segments.erase(it);
+            return true;
+        }
+    }
+
+    transaction->freed_memory.insert((uint64_t)target);
+    return true;
 }
