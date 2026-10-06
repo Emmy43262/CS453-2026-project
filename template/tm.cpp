@@ -287,7 +287,6 @@ bool tm_read(shared_t shared, tx_t tx, void const *source, size_t size, void *ta
             {
                 return false;
             }
-
             transaction->read_memory.insert(source_position + offset);
         }
     }
