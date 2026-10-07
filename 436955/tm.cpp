@@ -407,18 +407,18 @@ bool tm_write(shared_t shared, tx_t tx, void const *source, size_t size, void *t
         }
     }
 
-    Segment *source_segment = nullptr;
+    Segment *target_segment = nullptr;
     std::shared_lock<std::shared_mutex> segments_lock(region->segments_lock);
     for (auto &segment : region->segments)
     {
-        if (segment.is_in(source, size))
+        if (segment.is_in(target, size))
         {
-            source_segment = &segment;
+            target_segment = &segment;
             break;
         }
     }
     segments_lock.unlock();
-    if (source_segment == nullptr)
+    if (target_segment == nullptr)
         return false;
 
     uint64_t source_position = reinterpret_cast<uint64_t>(source);
@@ -436,7 +436,7 @@ bool tm_write(shared_t shared, tx_t tx, void const *source, size_t size, void *t
         if (mem == nullptr)
             return false;
         memcpy(mem, (void *)(source_position + offset), region->align);
-        transaction->dirty_memory[target_position + offset] = {mem, source_segment};
+        transaction->dirty_memory[target_position + offset] = {mem, target_segment};
     }
 
     return true;
