@@ -197,6 +197,30 @@ struct Transaction
 
     ~Transaction()
     {
+        std::list<Segment *> to_free;
+        {
+            region->transaction_start_lock.lock();
+            region->transaction_starts.erase(region->transaction_starts.find(rv));
+            auto final_iterator = region->transaction_starts.empty() ? region->memory_to_free.end() : region->memory_to_free.lower_bound(*region->transaction_starts.begin());
+
+            for (auto it = region->memory_to_free.begin(); it != final_iterator; it = region->memory_to_free.erase(it))
+            {
+                to_free.splice(to_free.end(), it->second);
+            }
+            region->transaction_start_lock.unlock();
+        }
+
+        std::unique_lock<std::shared_mutex> segments_lock(region->segments_lock);
+
+        std::list<Segment> segments_to_delete;
+        for (auto it = region->segments.begin(); it != region->segments.end();)
+        {
+            auto next_segment = std::next(it);
+            if (std::find(to_free.begin(), to_free.end(), &*it) != to_free.end())
+                segments_to_delete.splice(segments_to_delete.end(), region->segments, it);
+            it = next_segment;
+        }
+
         for (auto it : dirty_memory)
         {
             free(it.second.first);
@@ -225,8 +249,15 @@ tm_create(size_t size, size_t align) noexcept
 /** Destroy (i.e. clean-up + free) a given shared memory region.
  * @param shared Shared memory region to destroy, with no running transaction
  **/
-void tm_destroy(shared_t unused(shared)) noexcept
+void tm_destroy(shared_t shared) noexcept
 {
+    Region *region = static_cast<Region *>(shared);
+
+    for (auto &it : region->segments)
+    {
+        delete &it;
+    }
+    delete region;
 }
 
 /** [thread-safe] Return the start address of the first allocated segment in the shared memory region.
@@ -413,7 +444,6 @@ bool tm_end(shared_t shared, tx_t tx) noexcept
         memcpy((void *)address, dirty_address.second.first, region->align);
     }
 
-    std::list<Segment *> to_free;
     {
         region->transaction_start_lock.lock();
         for (auto segment : freed_segments)
@@ -421,30 +451,7 @@ bool tm_end(shared_t shared, tx_t tx) noexcept
             segment->is_free.store(true);
             region->memory_to_free[wv].push_back(segment);
         }
-        region->transaction_starts.erase(region->transaction_starts.find(transaction->rv));
-
-        auto final_iterator = region->transaction_starts.empty() ? region->memory_to_free.end() : region->memory_to_free.lower_bound(*region->transaction_starts.begin());
-
-        for (auto it = region->memory_to_free.begin(); it != final_iterator; it = region->memory_to_free.erase(it))
-        {
-            to_free.splice(to_free.end(), it->second);
-        }
         region->transaction_start_lock.unlock();
-    }
-
-    std::list<Segment> segments_to_delete;
-    {
-        std::unique_lock<std::shared_mutex> segments_lock(region->segments_lock);
-
-        for (auto it = region->segments.begin(); it != region->segments.end();)
-        {
-            auto next_segment = std::next(it);
-            if (std::find(to_free.begin(), to_free.end(), &*it) != to_free.end())
-                segments_to_delete.splice(segments_to_delete.end(), region->segments, it);
-            it = next_segment;
-        }
-
-        region->segments.splice(region->segments.end(), transaction->segments);
     }
 
     for (auto dirty_address : transaction->dirty_memory)
@@ -463,8 +470,26 @@ bool tm_end(shared_t shared, tx_t tx) noexcept
         {
             if (transaction->dirty_memory.find((uint64_t)segment->mem + index * segment->align) != transaction->dirty_memory.end())
                 continue;
-            segment->get_word_by_index(index)->release_lock();
+            segment->get_word_by_index(index)->release_lock(wv);
         }
+    }
+
+    std::list<Segment *> to_free;
+    {
+        region->transaction_start_lock.lock();
+        region->transaction_starts.erase(region->transaction_starts.find(transaction->rv));
+        auto final_iterator = region->transaction_starts.empty() ? region->memory_to_free.end() : region->memory_to_free.lower_bound(*region->transaction_starts.begin());
+
+        for (auto it = region->memory_to_free.begin(); it != final_iterator; it = region->memory_to_free.erase(it))
+        {
+            to_free.splice(to_free.end(), it->second);
+        }
+        region->transaction_start_lock.unlock();
+    }
+
+    {
+        std::unique_lock<std::shared_mutex> segments_lock(region->segments_lock);
+        region->segments.splice(region->segments.end(), transaction->segments);
     }
 
     delete transaction;
