@@ -71,6 +71,11 @@ struct Word
     {
         write_status.store(wv << 1);
     }
+
+    void release_lock()
+    {
+        write_status.fetch_and(-2);
+    }
 };
 
 struct Segment
@@ -248,6 +253,12 @@ tx_t tm_begin(shared_t shared, bool unused(is_ro)) noexcept
     }
 }
 
+void free_locks(std::vector<Word *> &locked_words)
+{
+    for (auto it : locked_words)
+        it->release_lock();
+}
+
 /** [thread-safe] End the given transaction.
  * @param shared Shared memory region associated with the transaction
  * @param tx     Transaction to end
@@ -258,6 +269,7 @@ bool tm_end(shared_t shared, tx_t tx) noexcept
     Region *region = static_cast<Region *>(shared);
     Transaction *transaction = reinterpret_cast<Transaction *>(tx);
 
+    std::vector<Word *> locked_words;
     for (auto dirty_address : transaction->dirty_memory)
     {
         uint64_t address = dirty_address.first;
@@ -273,10 +285,14 @@ bool tm_end(shared_t shared, tx_t tx) noexcept
                 break;
         }
         if (!locked)
+        {
+            free_locks(locked_words);
             return false;
+        }
+
+        locked_words.push_back(word);
     }
 
-    // TODO Free locks on failure
     // TODO Transaction destructor
     // TODO handle free
 
@@ -291,10 +307,16 @@ bool tm_end(shared_t shared, tx_t tx) noexcept
             uint64_t lock_value = word->write_status.load();
 
             if (lock_value & 1 && transaction->dirty_memory.find(read_address.first) == transaction->dirty_memory.end())
+            {
+                free_locks(locked_words);
                 return false;
+            }
 
             if (lock_value >> 1 > transaction->rv)
+            {
+                free_locks(locked_words);
                 return false;
+            }
         }
     }
 
