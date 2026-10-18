@@ -39,6 +39,7 @@
 #include <unordered_set>
 #include <cstring>
 #include <algorithm>
+#include <iostream>
 
 struct Word
 {
@@ -216,21 +217,25 @@ struct Transaction
             region->transaction_start_lock.unlock();
         }
 
-        std::unique_lock<std::shared_mutex> segments_lock(region->segments_lock);
-
-        std::list<Segment> segments_to_delete;
-        for (auto it = region->segments.begin(); it != region->segments.end();)
+        if (!to_free.empty())
         {
-            auto next_segment = std::next(it);
-            if (std::find(to_free.begin(), to_free.end(), &*it) != to_free.end())
-                segments_to_delete.splice(segments_to_delete.end(), region->segments, it);
-            it = next_segment;
+            std::list<Segment> segments_to_delete;
+            std::unique_lock<std::shared_mutex> segments_lock(region->segments_lock);
+            for (auto it = region->segments.begin(); it != region->segments.end();)
+            {
+                auto next_segment = std::next(it);
+                if (std::find(to_free.begin(), to_free.end(), &*it) != to_free.end())
+                    segments_to_delete.splice(segments_to_delete.end(), region->segments, it);
+                it = next_segment;
+            }
         }
 
         for (auto it : dirty_memory)
         {
             free(it.second.first);
         }
+
+        // std::cout << "End tx";
     }
 };
 
@@ -332,19 +337,28 @@ bool tm_end(shared_t shared, tx_t tx) noexcept
     Region *region = static_cast<Region *>(shared);
     Transaction *transaction = reinterpret_cast<Transaction *>(tx);
 
-    std::vector<Word *> locked_words;
-    for (auto dirty_address : transaction->dirty_memory)
+    if (transaction->dirty_memory.empty() && transaction->freed_memory.empty() && transaction->segments.empty())
     {
-        uint64_t address = dirty_address.first;
-        Segment *word_segment = dirty_address.second.second;
+        delete transaction;
+        // std::cout << "Good.\n";
+        return true;
+    }
 
+    std::vector<std::pair<uint64_t, Segment *>> to_lock;
+    to_lock.reserve(transaction->dirty_memory.size());
+    for (auto &entry : transaction->dirty_memory)
+        to_lock.push_back({entry.first, entry.second.second});
+    std::sort(to_lock.begin(), to_lock.end());
+
+    std::vector<Word *> locked_words;
+    for (auto &[address, word_segment] : to_lock)
+    {
         Word *word = word_segment->get_word(address);
 
         bool locked = false;
-        for (int i = 0; i < 100; i++)
+        for (int i = 0; i < 20000; i++)
         {
-            locked = word->try_lock();
-            if (locked)
+            if ((locked = word->try_lock()))
                 break;
         }
         if (!locked)
@@ -353,7 +367,6 @@ bool tm_end(shared_t shared, tx_t tx) noexcept
             delete transaction;
             return false;
         }
-
         locked_words.push_back(word);
     }
 
@@ -380,7 +393,7 @@ bool tm_end(shared_t shared, tx_t tx) noexcept
                 continue;
 
             bool locked = false;
-            for (int i = 0; i < 100; i++)
+            for (int i = 0; i < 20000; i++)
             {
                 locked = segment->get_word_by_index(index)->try_lock();
                 if (locked)
@@ -454,6 +467,7 @@ bool tm_end(shared_t shared, tx_t tx) noexcept
         region->transaction_start_lock.unlock();
     }
 
+    if (!transaction->segments.empty())
     {
         std::unique_lock<std::shared_mutex> segments_lock(region->segments_lock);
         region->segments.splice(region->segments.end(), transaction->segments);
@@ -480,6 +494,7 @@ bool tm_end(shared_t shared, tx_t tx) noexcept
     }
 
     delete transaction;
+    // std::cout << "Good.\n";
     return true;
 }
 
