@@ -38,6 +38,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <cstring>
+#include <algorithm>
 
 struct Word
 {
@@ -94,7 +95,7 @@ struct Segment
         this->size = size;
         this->align = align;
 
-        mem = malloc(size);
+        mem = aligned_alloc(align, size);
         if (mem == NULL)
             throw std::bad_alloc();
         memset(mem, 0, size);
@@ -104,7 +105,7 @@ struct Segment
         free(mem);
     }
 
-    bool is_in(const void *address, int size)
+    bool is_in(const void *address, size_t size)
     {
         uint64_t segment_start = reinterpret_cast<uint64_t>(mem);
         uint64_t address_start = reinterpret_cast<uint64_t>(address);
@@ -158,11 +159,16 @@ struct Region
     std::multiset<uint64_t> transaction_starts;
     std::map<uint64_t, std::list<Segment *>> memory_to_free;
 
+    size_t _size;
+    void *_start;
+
     Region(size_t size, size_t align)
     {
         this->align = align;
         this->size = size;
+        this->_size = size;
         this->segments.emplace_back(size, align);
+        this->_start = this->segments.front().mem;
     }
 
     uint64_t increment_clock()
@@ -251,13 +257,7 @@ tm_create(size_t size, size_t align) noexcept
  **/
 void tm_destroy(shared_t shared) noexcept
 {
-    Region *region = static_cast<Region *>(shared);
-
-    for (auto &it : region->segments)
-    {
-        delete &it;
-    }
-    delete region;
+    delete static_cast<Region *>(shared);
 }
 
 /** [thread-safe] Return the start address of the first allocated segment in the shared memory region.
@@ -266,7 +266,7 @@ void tm_destroy(shared_t shared) noexcept
  **/
 void *tm_start(shared_t shared) noexcept
 {
-    return static_cast<Region *>(shared)->segments.front().mem;
+    return static_cast<Region *>(shared)->_start;
 }
 
 /** [thread-safe] Return the size (in bytes) of the first allocated segment of the shared memory region.
@@ -275,7 +275,7 @@ void *tm_start(shared_t shared) noexcept
  **/
 size_t tm_size(shared_t shared) noexcept
 {
-    return static_cast<Region *>(shared)->segments.front().size;
+    return static_cast<Region *>(shared)->_size;
 }
 
 /** [thread-safe] Return the alignment (in bytes) of the memory accesses on the given shared memory region.
@@ -313,7 +313,7 @@ void free_locks(std::vector<Word *> &locked_words)
 void release_segment(Segment *segment, std::unordered_map<uint64_t, std::pair<void *, Segment *>> &dirty_memory, size_t max_index = 1e9)
 {
     size_t num_words = segment->num_words();
-    for (int index = 0; index < std::min(max_index, num_words); index++)
+    for (size_t index = 0; index < std::min(max_index, num_words); index++)
     {
         if (dirty_memory.find((uint64_t)segment->mem + index * segment->align) != dirty_memory.end())
             continue;
@@ -374,7 +374,7 @@ bool tm_end(shared_t shared, tx_t tx) noexcept
     {
         Segment *segment = freed_segments[i];
         size_t num_words = segment->num_words();
-        for (int index = 0; index < num_words; index++)
+        for (size_t index = 0; index < num_words; index++)
         {
             if (transaction->dirty_memory.find((uint64_t)segment->mem + index * segment->align) != transaction->dirty_memory.end())
                 continue;
@@ -412,7 +412,7 @@ bool tm_end(shared_t shared, tx_t tx) noexcept
 
             uint64_t lock_value = word->write_status.load();
 
-            if (lock_value & 1 && transaction->dirty_memory.find(read_address.first) == transaction->dirty_memory.end() && transaction->freed_memory.find((uint64_t)read_address.second) == transaction->freed_memory.end())
+            if (lock_value & 1 && transaction->dirty_memory.find(read_address.first) == transaction->dirty_memory.end() && transaction->freed_memory.find((uint64_t)read_address.second->mem) == transaction->freed_memory.end())
             {
                 free_locks(locked_words);
                 for (int j = 0; j < freed_segments.size(); j++)
@@ -454,6 +454,11 @@ bool tm_end(shared_t shared, tx_t tx) noexcept
         region->transaction_start_lock.unlock();
     }
 
+    {
+        std::unique_lock<std::shared_mutex> segments_lock(region->segments_lock);
+        region->segments.splice(region->segments.end(), transaction->segments);
+    }
+
     for (auto dirty_address : transaction->dirty_memory)
     {
         uint64_t address = dirty_address.first;
@@ -466,30 +471,12 @@ bool tm_end(shared_t shared, tx_t tx) noexcept
     {
         Segment *segment = freed_segments[i];
         size_t num_words = segment->num_words();
-        for (int index = 0; index < num_words; index++)
+        for (size_t index = 0; index < num_words; index++)
         {
             if (transaction->dirty_memory.find((uint64_t)segment->mem + index * segment->align) != transaction->dirty_memory.end())
                 continue;
             segment->get_word_by_index(index)->release_lock(wv);
         }
-    }
-
-    std::list<Segment *> to_free;
-    {
-        region->transaction_start_lock.lock();
-        region->transaction_starts.erase(region->transaction_starts.find(transaction->rv));
-        auto final_iterator = region->transaction_starts.empty() ? region->memory_to_free.end() : region->memory_to_free.lower_bound(*region->transaction_starts.begin());
-
-        for (auto it = region->memory_to_free.begin(); it != final_iterator; it = region->memory_to_free.erase(it))
-        {
-            to_free.splice(to_free.end(), it->second);
-        }
-        region->transaction_start_lock.unlock();
-    }
-
-    {
-        std::unique_lock<std::shared_mutex> segments_lock(region->segments_lock);
-        region->segments.splice(region->segments.end(), transaction->segments);
     }
 
     delete transaction;
