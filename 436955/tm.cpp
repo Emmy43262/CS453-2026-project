@@ -160,6 +160,7 @@ struct Region
     std::atomic<uint64_t> clock{0};
 
     std::list<Segment> segments;
+    std::map<uint64_t, Segment *> segment_starts;
     std::shared_mutex segments_lock;
 
     std::mutex transaction_start_lock;
@@ -172,7 +173,8 @@ struct Region
     Region(size_t size, size_t align)
     {
         this->align = align;
-        this->segments.emplace_back(size, align);
+        Segment &seg = segments.emplace_back(size, align);
+        segment_starts[reinterpret_cast<uint64_t>(seg.mem)] = &seg;
         this->size = size;
         this->_size = size;
         this->_start = this->segments.front().mem;
@@ -232,7 +234,10 @@ struct Transaction
             {
                 auto next_segment = std::next(it);
                 if (std::find(to_free.begin(), to_free.end(), &*it) != to_free.end())
+                {
+                    region->segment_starts.erase(reinterpret_cast<uint64_t>(it->mem));
                     segments_to_delete.splice(segments_to_delete.end(), region->segments, it);
+                }
                 it = next_segment;
             }
         }
@@ -356,13 +361,27 @@ bool tm_end(shared_t shared, tx_t tx) noexcept
         to_lock.push_back({entry.first, entry.second.second});
     std::sort(to_lock.begin(), to_lock.end());
 
+    std::vector<Segment *> freed_segments;
+    if (!transaction->freed_memory.empty())
+    {
+        std::shared_lock<std::shared_mutex> segments_lock(region->segments_lock);
+
+        for (auto &it : transaction->freed_memory)
+        {
+            auto seg_start = region->segment_starts.find(it);
+            if (seg_start != region->segment_starts.end())
+                freed_segments.push_back(seg_start->second);
+        }
+        segments_lock.unlock();
+    }
+
     std::vector<Word *> locked_words;
     for (auto &[address, word_segment] : to_lock)
     {
         Word *word = word_segment->get_word(address);
 
         bool locked = false;
-        for (int i = 0; i < 100000; i++)
+        for (int i = 0; i < 100; i++)
         {
             if ((locked = word->try_lock()))
                 break;
@@ -376,30 +395,17 @@ bool tm_end(shared_t shared, tx_t tx) noexcept
         locked_words.push_back(word);
     }
 
-    // TODO Transaction destructor
-    // TODO handle free
-
-    std::shared_lock<std::shared_mutex> segments_lock(region->segments_lock);
-    std::vector<Segment *> freed_segments;
-    for (auto &segment : region->segments)
-    {
-        if (transaction->freed_memory.find((uint64_t)segment.mem) == transaction->freed_memory.end())
-            continue;
-        freed_segments.push_back(&segment);
-    }
-    segments_lock.unlock();
-
     for (int i = 0; i < freed_segments.size(); i++)
     {
         Segment *segment = freed_segments[i];
         size_t num_words = segment->num_words();
         for (size_t index = 0; index < num_words; index++)
         {
-            if (!transaction->dirty_memory.empty() && transaction->dirty_memory.find((uint64_t)segment->mem + index * segment->align) != transaction->dirty_memory.end())
+            if (!transaction->dirty_memory.empty() && transaction->dirty_memory.find(segment->get_address(index)) != transaction->dirty_memory.end())
                 continue;
 
             bool locked = false;
-            for (int i = 0; i < 100000; i++)
+            for (int i = 0; i < 100; i++)
             {
                 locked = segment->get_word_by_index(index)->try_lock();
                 if (locked)
@@ -431,7 +437,7 @@ bool tm_end(shared_t shared, tx_t tx) noexcept
 
             uint64_t lock_value = word->write_status.load();
 
-            if (lock_value & 1 && !transaction->dirty_memory.empty() && transaction->dirty_memory.find(read_address.first) == transaction->dirty_memory.end() && transaction->freed_memory.find((uint64_t)read_address.second->mem) == transaction->freed_memory.end())
+            if (lock_value & 1 && transaction->dirty_memory.find(read_address.first) == transaction->dirty_memory.end() && transaction->freed_memory.find((uint64_t)read_address.second->mem) == transaction->freed_memory.end())
             {
                 unlock_words(locked_words);
                 for (int j = 0; j < freed_segments.size(); j++)
@@ -476,6 +482,8 @@ bool tm_end(shared_t shared, tx_t tx) noexcept
     if (!transaction->segments.empty())
     {
         std::unique_lock<std::shared_mutex> segments_lock(region->segments_lock);
+        for (auto &new_seg : transaction->segments)
+            region->segment_starts[reinterpret_cast<uint64_t>(new_seg.mem)] = &new_seg;
         region->segments.splice(region->segments.end(), transaction->segments);
     }
 
@@ -493,7 +501,7 @@ bool tm_end(shared_t shared, tx_t tx) noexcept
         size_t num_words = segment->num_words();
         for (size_t index = 0; index < num_words; index++)
         {
-            if (!transaction->dirty_memory.empty() && transaction->dirty_memory.find((uint64_t)segment->mem + index * segment->align) != transaction->dirty_memory.end())
+            if (!transaction->dirty_memory.empty() && transaction->dirty_memory.find(segment->get_address(index)) != transaction->dirty_memory.end())
                 continue;
             segment->get_word_by_index(index)->release_lock(wv);
         }
@@ -532,12 +540,26 @@ bool tm_read(shared_t shared, tx_t tx, void const *source, size_t size, void *ta
     else
     {
         std::shared_lock<std::shared_mutex> segments_lock(region->segments_lock);
-        for (auto &segment : region->segments)
-            if (segment.is_in(source, size))
-            {
-                source_segment = &segment;
-                break;
-            }
+
+        uint64_t source_start = reinterpret_cast<uint64_t>(source);
+
+        auto ub = region->segment_starts.upper_bound(source_start);
+
+        if (ub == region->segment_starts.begin())
+        {
+            segments_lock.unlock();
+            delete transaction;
+            return false;
+        }
+
+        source_segment = prev(ub)->second;
+
+        if (!source_segment->is_in(source, size))
+        {
+            segments_lock.unlock();
+            delete transaction;
+            return false;
+        }
         transaction->last_segment = source_segment;
     }
     if (source_segment == nullptr)
@@ -603,12 +625,25 @@ bool tm_write(shared_t shared, tx_t tx, void const *source, size_t size, void *t
     else
     {
         std::shared_lock<std::shared_mutex> segments_lock(region->segments_lock);
-        for (auto &segment : region->segments)
-            if (segment.is_in(target, size))
-            {
-                target_segment = &segment;
-                break;
-            }
+        uint64_t target_start = reinterpret_cast<uint64_t>(target);
+
+        auto ub = region->segment_starts.upper_bound(target_start);
+
+        if (ub == region->segment_starts.begin())
+        {
+            segments_lock.unlock();
+            delete transaction;
+            return false;
+        }
+
+        target_segment = prev(ub)->second;
+
+        if (!target_segment->is_in(target, size))
+        {
+            segments_lock.unlock();
+            delete transaction;
+            return false;
+        }
         transaction->last_segment = target_segment;
     }
     if (target_segment == nullptr)
