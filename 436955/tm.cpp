@@ -136,6 +136,12 @@ struct Segment
     {
         return size / align;
     }
+    uint64_t get_address(size_t index)
+    {
+        assert(index >= 0);
+        assert(index < num_words());
+        return (uint64_t)mem + index * align;
+    }
 
     Word *get_word_by_index(size_t index)
     {
@@ -166,9 +172,9 @@ struct Region
     Region(size_t size, size_t align)
     {
         this->align = align;
+        this->segments.emplace_back(size, align);
         this->size = size;
         this->_size = size;
-        this->segments.emplace_back(size, align);
         this->_start = this->segments.front().mem;
     }
 
@@ -189,8 +195,9 @@ struct Transaction
     uint64_t rv;
     std::list<Segment> segments;
     std::unordered_map<uint64_t, std::pair<void *, Segment *>> dirty_memory;
-    std::unordered_map<uint64_t, Segment *> read_memory;
+    std::vector<std::pair<uint64_t, Segment *>> read_memory;
     std::unordered_set<uint64_t> freed_memory;
+    Segment *last_segment = nullptr;
 
     Transaction(Region *region)
     {
@@ -309,18 +316,18 @@ tx_t tm_begin(shared_t shared, bool unused(is_ro)) noexcept
     }
 }
 
-void free_locks(std::vector<Word *> &locked_words)
+void unlock_words(std::vector<Word *> &locked_words)
 {
     for (auto it : locked_words)
         it->release_lock();
 }
 
-void release_segment(Segment *segment, std::unordered_map<uint64_t, std::pair<void *, Segment *>> &dirty_memory, size_t max_index = 1e9)
+void unlock_segment(Segment *segment, std::unordered_map<uint64_t, std::pair<void *, Segment *>> &dirty_memory, size_t max_index = 1e9)
 {
     size_t num_words = segment->num_words();
     for (size_t index = 0; index < std::min(max_index, num_words); index++)
     {
-        if (dirty_memory.find((uint64_t)segment->mem + index * segment->align) != dirty_memory.end())
+        if (!dirty_memory.empty() && dirty_memory.find(segment->get_address(index)) != dirty_memory.end())
             continue;
 
         segment->get_word_by_index(index)->release_lock();
@@ -340,7 +347,6 @@ bool tm_end(shared_t shared, tx_t tx) noexcept
     if (transaction->dirty_memory.empty() && transaction->freed_memory.empty() && transaction->segments.empty())
     {
         delete transaction;
-        // std::cout << "Good.\n";
         return true;
     }
 
@@ -356,14 +362,14 @@ bool tm_end(shared_t shared, tx_t tx) noexcept
         Word *word = word_segment->get_word(address);
 
         bool locked = false;
-        for (int i = 0; i < 20000; i++)
+        for (int i = 0; i < 100000; i++)
         {
             if ((locked = word->try_lock()))
                 break;
         }
         if (!locked)
         {
-            free_locks(locked_words);
+            unlock_words(locked_words);
             delete transaction;
             return false;
         }
@@ -389,11 +395,11 @@ bool tm_end(shared_t shared, tx_t tx) noexcept
         size_t num_words = segment->num_words();
         for (size_t index = 0; index < num_words; index++)
         {
-            if (transaction->dirty_memory.find((uint64_t)segment->mem + index * segment->align) != transaction->dirty_memory.end())
+            if (!transaction->dirty_memory.empty() && transaction->dirty_memory.find((uint64_t)segment->mem + index * segment->align) != transaction->dirty_memory.end())
                 continue;
 
             bool locked = false;
-            for (int i = 0; i < 20000; i++)
+            for (int i = 0; i < 100000; i++)
             {
                 locked = segment->get_word_by_index(index)->try_lock();
                 if (locked)
@@ -401,13 +407,13 @@ bool tm_end(shared_t shared, tx_t tx) noexcept
             }
             if (!locked)
             {
-                free_locks(locked_words);
+                unlock_words(locked_words);
 
-                release_segment(segment, transaction->dirty_memory, index);
+                unlock_segment(segment, transaction->dirty_memory, index);
 
                 for (int j = 0; j < i; j++)
                 {
-                    release_segment(freed_segments[j], transaction->dirty_memory);
+                    unlock_segment(freed_segments[j], transaction->dirty_memory);
                 }
                 delete transaction;
                 return false;
@@ -419,18 +425,18 @@ bool tm_end(shared_t shared, tx_t tx) noexcept
 
     if (wv != transaction->rv + 1)
     {
-        for (auto read_address : transaction->read_memory)
+        for (auto &read_address : transaction->read_memory)
         {
             Word *word = read_address.second->get_word(read_address.first);
 
             uint64_t lock_value = word->write_status.load();
 
-            if (lock_value & 1 && transaction->dirty_memory.find(read_address.first) == transaction->dirty_memory.end() && transaction->freed_memory.find((uint64_t)read_address.second->mem) == transaction->freed_memory.end())
+            if (lock_value & 1 && !transaction->dirty_memory.empty() && transaction->dirty_memory.find(read_address.first) == transaction->dirty_memory.end() && transaction->freed_memory.find((uint64_t)read_address.second->mem) == transaction->freed_memory.end())
             {
-                free_locks(locked_words);
+                unlock_words(locked_words);
                 for (int j = 0; j < freed_segments.size(); j++)
                 {
-                    release_segment(freed_segments[j], transaction->dirty_memory);
+                    unlock_segment(freed_segments[j], transaction->dirty_memory);
                 }
                 delete transaction;
                 return false;
@@ -438,10 +444,10 @@ bool tm_end(shared_t shared, tx_t tx) noexcept
 
             if (lock_value >> 1 > transaction->rv)
             {
-                free_locks(locked_words);
+                unlock_words(locked_words);
                 for (int j = 0; j < freed_segments.size(); j++)
                 {
-                    release_segment(freed_segments[j], transaction->dirty_memory);
+                    unlock_segment(freed_segments[j], transaction->dirty_memory);
                 }
                 delete transaction;
                 return false;
@@ -487,7 +493,7 @@ bool tm_end(shared_t shared, tx_t tx) noexcept
         size_t num_words = segment->num_words();
         for (size_t index = 0; index < num_words; index++)
         {
-            if (transaction->dirty_memory.find((uint64_t)segment->mem + index * segment->align) != transaction->dirty_memory.end())
+            if (!transaction->dirty_memory.empty() && transaction->dirty_memory.find((uint64_t)segment->mem + index * segment->align) != transaction->dirty_memory.end())
                 continue;
             segment->get_word_by_index(index)->release_lock(wv);
         }
@@ -521,16 +527,19 @@ bool tm_read(shared_t shared, tx_t tx, void const *source, size_t size, void *ta
     }
 
     Segment *source_segment = nullptr;
-    std::shared_lock<std::shared_mutex> segments_lock(region->segments_lock);
-    for (auto &segment : region->segments)
+    if (transaction->last_segment && transaction->last_segment->is_in(source, size))
+        source_segment = transaction->last_segment;
+    else
     {
-        if (segment.is_in(source, size))
-        {
-            source_segment = &segment;
-            break;
-        }
+        std::shared_lock<std::shared_mutex> segments_lock(region->segments_lock);
+        for (auto &segment : region->segments)
+            if (segment.is_in(source, size))
+            {
+                source_segment = &segment;
+                break;
+            }
+        transaction->last_segment = source_segment;
     }
-    segments_lock.unlock();
     if (source_segment == nullptr)
     {
         delete transaction;
@@ -541,7 +550,7 @@ bool tm_read(shared_t shared, tx_t tx, void const *source, size_t size, void *ta
     size_t align = region->align;
     for (size_t offset = 0; offset < size; offset += align)
     {
-        if (transaction->dirty_memory.find(source_position + offset) != transaction->dirty_memory.end())
+        if (!transaction->dirty_memory.empty() && transaction->dirty_memory.find(source_position + offset) != transaction->dirty_memory.end())
             memcpy((void *)((uint64_t)(target) + offset), transaction->dirty_memory[source_position + offset].first, align);
         else
         {
@@ -560,7 +569,7 @@ bool tm_read(shared_t shared, tx_t tx, void const *source, size_t size, void *ta
                 delete transaction;
                 return false;
             }
-            transaction->read_memory[source_position + offset] = source_segment;
+            transaction->read_memory.push_back({source_position + offset, source_segment});
         }
     }
     return true;
@@ -589,16 +598,19 @@ bool tm_write(shared_t shared, tx_t tx, void const *source, size_t size, void *t
     }
 
     Segment *target_segment = nullptr;
-    std::shared_lock<std::shared_mutex> segments_lock(region->segments_lock);
-    for (auto &segment : region->segments)
+    if (transaction->last_segment && transaction->last_segment->is_in(target, size))
+        target_segment = transaction->last_segment;
+    else
     {
-        if (segment.is_in(target, size))
-        {
-            target_segment = &segment;
-            break;
-        }
+        std::shared_lock<std::shared_mutex> segments_lock(region->segments_lock);
+        for (auto &segment : region->segments)
+            if (segment.is_in(target, size))
+            {
+                target_segment = &segment;
+                break;
+            }
+        transaction->last_segment = target_segment;
     }
-    segments_lock.unlock();
     if (target_segment == nullptr)
     {
         delete transaction;
@@ -610,7 +622,7 @@ bool tm_write(shared_t shared, tx_t tx, void const *source, size_t size, void *t
     size_t align = region->align;
     for (size_t offset = 0; offset < size; offset += align)
     {
-        if (transaction->dirty_memory.find(target_position + offset) != transaction->dirty_memory.end())
+        if (!transaction->dirty_memory.empty() && transaction->dirty_memory.find(target_position + offset) != transaction->dirty_memory.end())
         {
             memcpy(transaction->dirty_memory[target_position + offset].first, (void *)(source_position + offset), region->align);
             continue;
